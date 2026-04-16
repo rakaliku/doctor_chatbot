@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: hospital-chatbot-backend
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: HF_TOKEN
+        sync: false
+      - key: HF_MODELS
+        value: Qwen/Qwen2.5-1.5B-Instruct:featherless-ai,Qwen/Qwen2.5-1.5B-Instruct
+      - key: DATABASE_URL
+        fromDatabase:
+          name: hospital-chatbot-db
+          property: connectionString
+
+databases:
+  - name: hospital-chatbot-db
+    plan: free
