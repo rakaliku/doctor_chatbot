@@ -7,6 +7,9 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from db_config import init_db, seed_sample_data, SessionLocal, Doctor, Vaccine, Appointment
 from chatbot import get_chat_reply
+import os
+
+port = int(os.environ.get("PORT", 8000))
 
 app = FastAPI()
 init_db()
@@ -84,3 +87,7 @@ def get_appointment_status(appointment_id: int, db: Session = Depends(get_db)):
 @app.post("/chat/")
 def chat(payload: ChatRequest, db: Session = Depends(get_db)):
     return get_chat_reply(payload.user_input, db, payload.session_id)
+
+@app.get("/health")
+def health():
+    return {"ok": True}
