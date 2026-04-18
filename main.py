@@ -1,4 +1,6 @@
+import re
 from pathlib import Path
+from datetime import datetime
 
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.responses import FileResponse
@@ -17,6 +19,38 @@ seed_sample_data()
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+def _parse_requested_time(date_time: str):
+    normalized = re.sub(r"\s+", " ", date_time.strip())
+    formats = [
+        "%Y-%m-%d %I:%M %p",
+        "%Y-%m-%d %H:%M",
+        "%d/%m/%Y %I:%M %p",
+        "%d/%m/%Y %H:%M",
+        "%I:%M %p",
+        "%H:%M",
+    ]
+    for fmt in formats:
+        try:
+            return datetime.strptime(normalized, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _is_within_doctor_hours(doctor: Doctor, requested_date_time: str) -> bool:
+    requested = _parse_requested_time(requested_date_time)
+    if requested is None:
+        return True
+
+    start_text, end_text = [part.strip() for part in doctor.available_time.split("-", 1)]
+    start = datetime.strptime(start_text, "%H:%M")
+    end = datetime.strptime(end_text, "%H:%M")
+    requested_minutes = requested.hour * 60 + requested.minute
+    start_minutes = start.hour * 60 + start.minute
+    end_minutes = end.hour * 60 + end.minute
+    return start_minutes <= requested_minutes <= end_minutes
 
 
 def get_db():
@@ -57,6 +91,16 @@ def get_vaccines(db: Session = Depends(get_db)):
 
 @app.post("/book")
 def book_appointment(payload: AppointmentRequest, db: Session = Depends(get_db)):
+    doctor = db.query(Doctor).filter(Doctor.id == payload.doctor_id).first()
+    if not doctor:
+        raise HTTPException(status_code=404, detail="Doctor not found")
+
+    if not _is_within_doctor_hours(doctor, payload.date_time):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{doctor.name} is available only during {doctor.available_time}",
+        )
+
     appt = Appointment(
         patient_name=payload.patient_name,
         doctor_id=payload.doctor_id,

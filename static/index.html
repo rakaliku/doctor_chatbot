@@ -355,8 +355,8 @@
         <section class="hero">
             <h1>Hospital Chatbot Tester</h1>
             <p>
-                Use this basic page to test the dummy appointment booking flow. The chatbot collects a patient name,
-                a doctor, and a preferred date/time, then saves the appointment in the backend database.
+                Test the LLM-assisted appointment booking flow. The chatbot now responds conversationally while the
+                backend still validates the patient name, doctor, and preferred date/time before saving the appointment.
             </p>
         </section>
 
@@ -618,7 +618,7 @@
             helperPanel.innerHTML = "";
             sourceBadge.textContent = "Response source: not used yet";
             messages.innerHTML = "";
-            addMessage("bot", "Hello. I can help you book a dummy doctor appointment. Start by sharing the patient's name or ask to see the doctors.");
+            addMessage("bot", "Hello. I can help you book a doctor appointment. Start by sharing the patient's name or ask to see the doctors.");
         }
 
         sendBtn.addEventListener("click", sendMessage);
