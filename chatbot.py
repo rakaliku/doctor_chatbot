@@ -1,7 +1,6 @@
 import os
 import re
-import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -9,6 +8,13 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from db_config import Appointment, Doctor
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
 
 DEFAULT_MODELS = [
     model.strip()
@@ -22,10 +28,16 @@ HF_TOKEN = os.getenv("HF_TOKEN")
 HF_CHAT_URL = "https://router.huggingface.co/v1/chat/completions"
 
 _sessions: Dict[str, Dict[str, Any]] = {}
+_next_session_id = 1
 
 
 def _get_session(session_id: Optional[str]) -> Tuple[str, Dict[str, Any]]:
-    actual_session_id = session_id or str(uuid.uuid4())
+    global _next_session_id
+    # Numeric session ids avoid confusing chat ids with appointment ids in the UI.
+    actual_session_id = session_id
+    if not actual_session_id:
+        actual_session_id = str(_next_session_id)
+        _next_session_id += 1
     if actual_session_id not in _sessions:
         _sessions[actual_session_id] = {
             "patient_name": None,
@@ -42,6 +54,7 @@ def _get_session(session_id: Optional[str]) -> Tuple[str, Dict[str, Any]]:
 
 def _extract_name(user_input: str) -> Optional[str]:
     patterns = [
+        r"(?:it's|its|it is)\s+([A-Za-z][A-Za-z\s]{0,40})",
         r"(?:my name is|i am|i'm)\s+([A-Za-z][A-Za-z\s]{0,40})",
         r"(?:patient name is|patient is|name is)\s+([A-Za-z][A-Za-z\s]{0,40})",
         r"name\s*[:\-]\s*([A-Za-z][A-Za-z\s]{1,40})",
@@ -52,17 +65,18 @@ def _extract_name(user_input: str) -> Optional[str]:
             candidate_words = match.group(1).strip(" .,!").split()
             stop_words = {
                 "and",
+                "is",
                 "for",
                 "to",
                 "with",
                 "looking",
                 "want",
                 "need",
-        "book",
-        "appointment",
-        "doctor",
-        "dr",
-        "tomorrow",
+                "book",
+                "appointment",
+                "doctor",
+                "dr",
+                "tomorrow",
                 "today",
             }
             cleaned_words = []
@@ -384,11 +398,16 @@ def _ensure_booking_details_in_reply(
     if not booked or not doctor or not appointment_id:
         return reply
 
+    reply = re.sub(
+        r"(?im)Appointment\s+ID\s*:.*$",
+        f"Appointment ID: {int(appointment_id)}",
+        reply,
+    ).rstrip()
     required_lines = [
         f"Patient: {session['patient_name']}",
         f"Doctor: {doctor.name}",
         f"Date & Time: {session['date_time']}",
-        f"Appointment ID: {appointment_id}",
+        f"Appointment ID: {int(appointment_id)}",
     ]
     missing_lines = [line for line in required_lines if line not in reply]
     if not missing_lines:
@@ -437,6 +456,7 @@ def _build_llm_messages(
                 "Keep replies short, warm, and practical. "
                 "Stay grounded in the provided doctor list and booking state. "
                 "Never invent doctors, timings, appointment ids, or policies. "
+                "Never say an appointment is booked unless next_step is completed. "
                 "If a field is missing, ask only for the next missing field. "
                 "If the backend provides an appointment id, you must include it in the confirmation. "
                 "If the user asks for available doctors, summarize the list clearly. "
@@ -466,6 +486,35 @@ def _build_llm_messages(
     ]
 
 
+def _reply_claims_booking(reply: str) -> bool:
+    lowered = reply.lower()
+    return any(
+        phrase in lowered
+        for phrase in [
+            "appointment is booked",
+            "appointment has been booked",
+            "successfully booked",
+            "appointment details",
+        ]
+    )
+
+
+def _ensure_full_doctor_list_in_reply(reply: str, doctor_list: str, next_step: str) -> str:
+    if next_step != "doctor_id" or not doctor_list:
+        return reply
+
+    missing_doctors = [
+        line
+        for line in doctor_list.splitlines()
+        if line.strip() and line.strip() not in reply
+    ]
+    if not missing_doctors:
+        return reply
+
+    # Keep doctor selection deterministic; HF may summarize away some rows.
+    return reply.rstrip() + "\n\nAvailable doctors:\n" + doctor_list
+
+
 def _generate_hf_reply(
     user_input: str,
     rule_reply: str,
@@ -473,15 +522,14 @@ def _generate_hf_reply(
     doctor_list: str,
     next_step: str,
 ) -> Tuple[Optional[str], str, Optional[str], Optional[str]]:
-    if not HF_TOKEN or HF_TOKEN == "PASTE_YOUR_HF_TOKEN_HERE":
+    if not HF_TOKEN or HF_TOKEN in {"PASTE_YOUR_HF_TOKEN_HERE", "hf_your_token_here"}:
         return None, "fallback", "HF token is missing.", None
 
     errors = []
     messages = _build_llm_messages(user_input, rule_reply, session, doctor_list, next_step)
-
     for model_name in DEFAULT_MODELS:
         try:
-            response = requests.post(
+            hf_response = requests.post(
                 HF_CHAT_URL,
                 headers={
                     "Authorization": f"Bearer {HF_TOKEN}",
@@ -495,17 +543,77 @@ def _generate_hf_reply(
                 },
                 timeout=30,
             )
-            if not response.ok:
-                errors.append(f"{model_name} -> {response.status_code}")
+            if not hf_response.ok:
+                errors.append(f"{model_name} -> {hf_response.status_code}: {hf_response.text[:160]}")
                 continue
 
-            data = response.json()
+            data = hf_response.json()
             cleaned = data["choices"][0]["message"]["content"].strip()
             return (cleaned or None), "huggingface", None if cleaned else "Empty HF reply.", model_name
         except Exception as exc:
             errors.append(f"{model_name} -> {exc}")
 
     return None, "fallback", "HF failed for models: " + " | ".join(errors), None
+
+
+def _finalize_chat_response(
+    *,
+    user_input: str,
+    rule_reply: str,
+    session_id: str,
+    session: Dict[str, Any],
+    doctor_list: str,
+    next_step: str,
+    booked: bool = False,
+    doctor: Optional[Doctor] = None,
+    appointment_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    hf_reply, response_source, response_error, model_used = _generate_hf_reply(
+        user_input=user_input,
+        rule_reply=rule_reply,
+        session=session,
+        doctor_list=doctor_list,
+        next_step=next_step,
+    )
+    reply = hf_reply or rule_reply
+    if next_step == "doctor_id":
+        # Doctor choice must come from the DB list, not from HF preference.
+        reply = rule_reply
+        response_source = "backend_guardrail"
+        response_error = None
+        model_used = None
+    if not booked and _reply_claims_booking(reply):
+        # State wins over phrasing: do not allow HF to confirm unsaved bookings.
+        reply = rule_reply
+        response_source = "backend_guardrail"
+        response_error = "HF reply claimed a booking before the backend saved one."
+        model_used = None
+    reply = _ensure_full_doctor_list_in_reply(reply, doctor_list, next_step)
+    reply = _ensure_booking_details_in_reply(reply, session, doctor, appointment_id, booked)
+    session["history"].append({"role": "assistant", "content": reply})
+
+    if booked:
+        _sessions[session_id] = {
+            "patient_name": None,
+            "doctor_id": None,
+            "date_time": None,
+            "appointment_id": None,
+            "pending_doctor_id": None,
+            "pending_date_time": None,
+            "pending_confirmation": None,
+            "history": [],
+        }
+
+    return {
+        "session_id": session_id,
+        "reply": reply,
+        "booking_completed": booked,
+        "appointment_id": appointment_id,
+        "next_step": next_step,
+        "response_source": response_source,
+        "model_used": model_used,
+        "response_error": response_error,
+    }
 
 
 def get_chat_reply(user_input: str, db: Session, session_id: Optional[str] = None):
@@ -552,21 +660,14 @@ def get_chat_reply(user_input: str, db: Session, session_id: Optional[str] = Non
         else:
             rule_reply = "Please share the patient's name before I book the appointment."
         next_step = "patient_name"
-        reply = rule_reply
-        response_source = "backend"
-        response_error = None
-        model_used = None
-        session["history"].append({"role": "assistant", "content": reply})
-        return {
-            "session_id": session_id,
-            "reply": reply,
-            "booking_completed": False,
-            "appointment_id": None,
-            "next_step": next_step,
-            "response_source": response_source,
-            "model_used": model_used,
-            "response_error": response_error,
-        }
+        return _finalize_chat_response(
+            user_input=user_input,
+            rule_reply=rule_reply,
+            session_id=session_id,
+            session=session,
+            doctor_list=doctor_list,
+            next_step=next_step,
+        )
 
     if session.get("pending_confirmation"):
         if _is_confirmation(user_input):
@@ -584,21 +685,14 @@ def get_chat_reply(user_input: str, db: Session, session_id: Optional[str] = Non
             session["pending_confirmation"] = None
             rule_reply = "No problem. Please share another preferred date or time."
             next_step = "date_time" if session.get("doctor_id") else _get_next_step(session, False)
-            reply = rule_reply
-            response_source = "backend"
-            response_error = None
-            model_used = None
-            session["history"].append({"role": "assistant", "content": reply})
-            return {
-                "session_id": session_id,
-                "reply": reply,
-                "booking_completed": False,
-                "appointment_id": None,
-                "next_step": next_step,
-                "response_source": response_source,
-                "model_used": model_used,
-                "response_error": response_error,
-            }
+            return _finalize_chat_response(
+                user_input=user_input,
+                rule_reply=rule_reply,
+                session_id=session_id,
+                session=session,
+                doctor_list=doctor_list,
+                next_step=next_step,
+            )
 
     relative_preference = _extract_relative_preference(user_input)
     if relative_preference and doctor and not date_time:
@@ -607,25 +701,14 @@ def get_chat_reply(user_input: str, db: Session, session_id: Optional[str] = Non
         session["pending_confirmation"] = relative_preference
         rule_reply = _build_availability_reply(doctor, relative_preference, session)
         next_step = "review"
-        hf_reply, response_source, response_error, model_used = _generate_hf_reply(
+        return _finalize_chat_response(
             user_input=user_input,
             rule_reply=rule_reply,
+            session_id=session_id,
             session=session,
             doctor_list=doctor_list,
             next_step=next_step,
         )
-        reply = hf_reply or rule_reply
-        session["history"].append({"role": "assistant", "content": reply})
-        return {
-            "session_id": session_id,
-            "reply": reply,
-            "booking_completed": False,
-            "appointment_id": None,
-            "next_step": next_step,
-            "response_source": response_source,
-            "model_used": model_used,
-            "response_error": response_error,
-        }
 
     if requested_doctor_name and not doctor:
         rule_reply = (
@@ -633,61 +716,40 @@ def get_chat_reply(user_input: str, db: Session, session_id: Optional[str] = Non
             f"Please choose one of the available doctors:\n{doctor_list}"
         )
         next_step = "doctor_id"
-        # Keep the fallback deterministic so the doctor list is always shown.
-        reply = rule_reply
-        response_source = "backend"
-        response_error = None
-        model_used = None
-        session["history"].append({"role": "assistant", "content": reply})
-        return {
-            "session_id": session_id,
-            "reply": reply,
-            "booking_completed": False,
-            "appointment_id": None,
-            "next_step": next_step,
-            "response_source": response_source,
-            "model_used": model_used,
-            "response_error": response_error,
-        }
+        return _finalize_chat_response(
+            user_input=user_input,
+            rule_reply=rule_reply,
+            session_id=session_id,
+            session=session,
+            doctor_list=doctor_list,
+            next_step=next_step,
+        )
 
     if doctor and session.get("date_time") and not _is_within_doctor_hours(doctor, session["date_time"]):
         session["date_time"] = None
         rule_reply = _build_out_of_hours_reply(doctor)
         next_step = "date_time"
-        reply = rule_reply
-        response_source = "backend"
-        response_error = None
-        model_used = None
-        session["history"].append({"role": "assistant", "content": reply})
-        return {
-            "session_id": session_id,
-            "reply": reply,
-            "booking_completed": False,
-            "appointment_id": None,
-            "next_step": next_step,
-            "response_source": response_source,
-            "model_used": model_used,
-            "response_error": response_error,
-        }
+        return _finalize_chat_response(
+            user_input=user_input,
+            rule_reply=rule_reply,
+            session_id=session_id,
+            session=session,
+            doctor_list=doctor_list,
+            next_step=next_step,
+            doctor=doctor,
+        )
 
     if wants_doctors and not session.get("doctor_id"):
         rule_reply = "Here are the available doctors:\n" + doctor_list
         next_step = _get_next_step(session, False)
-        reply = rule_reply
-        response_source = "backend"
-        response_error = None
-        model_used = None
-        session["history"].append({"role": "assistant", "content": reply})
-        return {
-            "session_id": session_id,
-            "reply": reply,
-            "booking_completed": False,
-            "appointment_id": None,
-            "next_step": next_step,
-            "response_source": response_source,
-            "model_used": model_used,
-            "response_error": response_error,
-        }
+        return _finalize_chat_response(
+            user_input=user_input,
+            rule_reply=rule_reply,
+            session_id=session_id,
+            session=session,
+            doctor_list=doctor_list,
+            next_step=next_step,
+        )
 
     booked = False
     appointment_id = None
@@ -704,10 +766,12 @@ def get_chat_reply(user_input: str, db: Session, session_id: Optional[str] = Non
             db.refresh(appointment)
 
             booked = True
-            appointment_id = appointment.id
-            session["appointment_id"] = str(appointment.id)
+            if appointment.id is None:
+                raise ValueError("Appointment was saved without an id.")
+            appointment_id = int(appointment.id)
+            session["appointment_id"] = str(appointment_id)
             doctor = db.query(Doctor).filter(Doctor.id == int(session["doctor_id"])).first()
-        except SQLAlchemyError as exc:
+        except (SQLAlchemyError, ValueError) as exc:
             db.rollback()
             booking_error = f"Could not save the appointment: {exc.__class__.__name__}."
 
@@ -716,48 +780,14 @@ def get_chat_reply(user_input: str, db: Session, session_id: Optional[str] = Non
         or _build_rule_reply({**session, "doctor_list": doctor_list}, doctor, booked)
     )
     next_step = _get_next_step(session, booked)
-    if booked:
-        reply = rule_reply
-        response_source = "backend"
-        response_error = None
-        model_used = None
-    else:
-        if next_step in {"patient_name", "doctor_id", "date_time"}:
-            reply = rule_reply
-            response_source = "backend"
-            response_error = None
-            model_used = None
-        else:
-            hf_reply, response_source, response_error, model_used = _generate_hf_reply(
-                user_input=user_input,
-                rule_reply=rule_reply,
-                session=session,
-                doctor_list=doctor_list,
-                next_step=next_step,
-            )
-            reply = hf_reply or rule_reply
-            reply = _ensure_booking_details_in_reply(reply, session, doctor, appointment_id, booked)
-    session["history"].append({"role": "assistant", "content": reply})
-
-    if booked:
-        _sessions[session_id] = {
-            "patient_name": None,
-            "doctor_id": None,
-            "date_time": None,
-            "appointment_id": None,
-            "pending_doctor_id": None,
-            "pending_date_time": None,
-            "pending_confirmation": None,
-            "history": [],
-        }
-
-    return {
-        "session_id": session_id,
-        "reply": reply,
-        "booking_completed": booked,
-        "appointment_id": appointment_id,
-        "next_step": next_step,
-        "response_source": response_source,
-        "model_used": model_used,
-        "response_error": response_error,
-    }
+    return _finalize_chat_response(
+        user_input=user_input,
+        rule_reply=rule_reply,
+        session_id=session_id,
+        session=session,
+        doctor_list=doctor_list,
+        next_step=next_step,
+        booked=booked,
+        doctor=doctor,
+        appointment_id=appointment_id,
+    )

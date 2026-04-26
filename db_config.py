@@ -3,6 +3,9 @@ import os
 from sqlalchemy import create_engine, Column, Integer, String, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
+# from dotenv import load_dotenv
+
+# load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./hospital.db")
 
