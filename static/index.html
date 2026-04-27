@@ -17,6 +17,7 @@
             --user: #dff4ea;
             --bot: #f3e7d8;
             --ok: #1f7a45;
+            --error: #a32929;
         }
 
         * {
@@ -110,6 +111,49 @@
             font-size: 0.92rem;
             white-space: normal;
             overflow-wrap: anywhere;
+        }
+
+        .payment-box {
+            margin-top: 18px;
+            padding-top: 18px;
+            border-top: 1px solid var(--border);
+        }
+
+        .payment-box input {
+            width: 100%;
+            min-height: 44px;
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            padding: 10px 12px;
+            font: inherit;
+            background: #fff;
+        }
+
+        .payment-status {
+            margin-top: 12px;
+            padding: 12px;
+            border-radius: 14px;
+            background: #fff;
+            border: 1px solid var(--border);
+            color: var(--muted);
+            line-height: 1.45;
+            display: none;
+        }
+
+        .payment-status.show {
+            display: block;
+        }
+
+        .payment-status.success {
+            color: var(--ok);
+            border-color: #9dc3ad;
+            background: #eff9f2;
+        }
+
+        .payment-status.error {
+            color: var(--error);
+            border-color: #e2aaaa;
+            background: #fff4f4;
         }
 
         .doctors {
@@ -369,6 +413,16 @@
                 </div>
                 <div class="source-badge" id="sourceBadge">Response source: not used yet</div>
 
+                <div class="payment-box">
+                    <h2>Payment</h2>
+                    <p class="muted">Pay the consultation fee after confirming your appointment details.</p>
+                    <input id="paymentAmountInput" type="number" min="1" step="1" value="500" placeholder="Amount in INR">
+                    <div class="actions">
+                        <button type="button" id="payBtn">Pay Now</button>
+                    </div>
+                    <div class="payment-status" id="paymentStatus"></div>
+                </div>
+
                 <h2>Doctors</h2>
                 <p class="muted">Pick a doctor id from the list or ask the chatbot to show doctors.</p>
                 <div class="actions">
@@ -401,6 +455,7 @@
         </section>
     </div>
 
+    <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
     <script>
         const messages = document.getElementById("messages");
         const input = document.getElementById("messageInput");
@@ -416,6 +471,9 @@
         const checkStatusBtn = document.getElementById("checkStatusBtn");
         const lookupResult = document.getElementById("lookupResult");
         const sourceBadge = document.getElementById("sourceBadge");
+        const paymentAmountInput = document.getElementById("paymentAmountInput");
+        const payBtn = document.getElementById("payBtn");
+        const paymentStatus = document.getElementById("paymentStatus");
 
         let sessionId = null;
         let doctorsCache = [];
@@ -437,6 +495,11 @@
             const model = response?.model_used ? ` (${response.model_used})` : "";
             const error = response?.response_error ? ` | ${response.response_error}` : "";
             sourceBadge.textContent = `Response source: ${source}${model}${error}`;
+        }
+
+        function setPaymentStatus(message, type = "") {
+            paymentStatus.className = `payment-status show ${type}`.trim();
+            paymentStatus.textContent = message;
         }
 
         function showAppointment(response) {
@@ -481,6 +544,110 @@
                 lookupResult.textContent = "Unable to fetch appointment status right now.";
             } finally {
                 checkStatusBtn.disabled = false;
+            }
+        }
+
+        async function startPayment() {
+            const amountInRupees = Number(paymentAmountInput.value);
+            const amountInPaise = Math.round(amountInRupees * 100);
+
+            if (!Number.isFinite(amountInPaise) || amountInPaise < 100) {
+                setPaymentStatus("Enter an amount of at least INR 1.", "error");
+                return;
+            }
+
+            if (!window.Razorpay) {
+                setPaymentStatus("Razorpay checkout could not be loaded. Check your internet connection and try again.", "error");
+                return;
+            }
+
+            payBtn.disabled = true;
+            setPaymentStatus("Creating payment order...");
+
+            try {
+                const [configResponse, orderResponse] = await Promise.all([
+                    fetch("/api/payment-config"),
+                    fetch("/api/create-order", {
+                        method: "POST",
+                        headers: {
+                            "Content-Type": "application/json"
+                        },
+                        body: JSON.stringify({
+                            amount: amountInPaise,
+                            currency: "INR",
+                            receipt: `hospital_${Date.now()}`
+                        })
+                    })
+                ]);
+
+                const config = await configResponse.json();
+                const order = await orderResponse.json();
+
+                if (!configResponse.ok) {
+                    throw new Error(config.detail || "Unable to load payment configuration.");
+                }
+
+                if (!orderResponse.ok) {
+                    throw new Error(order.detail || "Unable to create payment order.");
+                }
+
+                const checkout = new Razorpay({
+                    key: config.key_id,
+                    amount: order.amount,
+                    currency: order.currency,
+                    name: "Hospital Appointment",
+                    description: "Consultation fee",
+                    order_id: order.order_id,
+                    handler: async (paymentResponse) => {
+                        try {
+                            setPaymentStatus("Verifying payment...");
+
+                            const verifyResponse = await fetch("/api/verify-payment", {
+                                method: "POST",
+                                headers: {
+                                    "Content-Type": "application/json"
+                                },
+                                body: JSON.stringify({
+                                    razorpay_payment_id: paymentResponse.razorpay_payment_id,
+                                    razorpay_order_id: paymentResponse.razorpay_order_id,
+                                    razorpay_signature: paymentResponse.razorpay_signature
+                                })
+                            });
+                            const verifyData = await verifyResponse.json();
+
+                            if (!verifyResponse.ok) {
+                                throw new Error(verifyData.detail || "Payment verification failed.");
+                            }
+
+                            setPaymentStatus(
+                                `Payment verified. Payment ID: ${paymentResponse.razorpay_payment_id}`,
+                                "success"
+                            );
+                        } catch (error) {
+                            setPaymentStatus(error.message || "Payment verification failed.", "error");
+                        }
+                    },
+                    modal: {
+                        ondismiss: () => {
+                            setPaymentStatus("Payment cancelled before completion.", "error");
+                        }
+                    },
+                    theme: {
+                        color: "#1d6b57"
+                    }
+                });
+
+                checkout.on("payment.failed", (response) => {
+                    const message = response?.error?.description || "Payment failed. Please try again.";
+                    setPaymentStatus(message, "error");
+                });
+
+                checkout.open();
+                setPaymentStatus("Complete the payment in the Razorpay window.");
+            } catch (error) {
+                setPaymentStatus(error.message || "Payment could not be started.", "error");
+            } finally {
+                payBtn.disabled = false;
             }
         }
 
@@ -625,6 +792,7 @@
         loadDoctorsBtn.addEventListener("click", loadDoctors);
         resetBtn.addEventListener("click", resetChat);
         checkStatusBtn.addEventListener("click", checkAppointmentStatus);
+        payBtn.addEventListener("click", startPayment);
         appointmentLookupInput.addEventListener("keydown", (event) => {
             if (event.key === "Enter") {
                 event.preventDefault();
