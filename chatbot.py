@@ -592,17 +592,9 @@ def _finalize_chat_response(
     reply = _ensure_booking_details_in_reply(reply, session, doctor, appointment_id, booked)
     session["history"].append({"role": "assistant", "content": reply})
 
-    if booked:
-        _sessions[session_id] = {
-            "patient_name": None,
-            "doctor_id": None,
-            "date_time": None,
-            "appointment_id": None,
-            "pending_doctor_id": None,
-            "pending_date_time": None,
-            "pending_confirmation": None,
-            "history": [],
-        }
+    # Preserve session booking state so the user can continue (e.g., pay) after confirmation.
+    # Do not reset the session automatically on booking — allow the frontend and user to confirm next steps.
+    # If desired, a manual 'reset' action can clear the session.
 
     return {
         "session_id": session_id,
@@ -754,7 +746,10 @@ def get_chat_reply(user_input: str, db: Session, session_id: Optional[str] = Non
     booked = False
     appointment_id = None
     booking_error = None
-    if session["patient_name"] and session["doctor_id"] and session["date_time"]:
+    # Only create an appointment if all required fields are present and an appointment hasn't
+    # already been created for this session. This prevents duplicate bookings when the user
+    # selects doctor or date/time in separate messages.
+    if session["patient_name"] and session["doctor_id"] and session["date_time"] and not session.get("appointment_id"):
         try:
             appointment = Appointment(
                 patient_name=session["patient_name"],
@@ -774,6 +769,11 @@ def get_chat_reply(user_input: str, db: Session, session_id: Optional[str] = Non
         except (SQLAlchemyError, ValueError) as exc:
             db.rollback()
             booking_error = f"Could not save the appointment: {exc.__class__.__name__}."
+    elif session.get("appointment_id"):
+        # If appointment already exists for this session, surface it (avoid creating another).
+        booked = True
+        appointment_id = int(session.get("appointment_id"))
+        doctor = db.query(Doctor).filter(Doctor.id == int(session.get("doctor_id"))).first() if session.get("doctor_id") else None
 
     rule_reply = (
         booking_error
