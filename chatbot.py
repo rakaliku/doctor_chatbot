@@ -142,18 +142,22 @@ def _extract_doctor(db: Session, user_input: str) -> Optional[Doctor]:
     stripped = lowered.strip()
     has_doctor_context = any(
         phrase in lowered
-        for phrase in ["doctor", "dr ", "dr.", "appointment with", "book with", "consult with"]
+        for phrase in ["doctor", "dr ", "dr.", "appointment with", "appointment of", "appointment for", "book with", "consult with"]
     )
     doctors = db.query(Doctor).all()
 
     if has_doctor_context:
         name_match = re.search(
-            r"(?:doctor|dr\.?|doc|appointment with|book with|consult with)\s+([A-Za-z][A-Za-z\s]{0,40})",
+            r"(?:doctor|dr\.?|doc|appointment with|appointment of|appointment for|book with|consult with)\s+([A-Za-z][A-Za-z\s]{0,40})",
             user_input,
             re.IGNORECASE,
         )
         if name_match:
             requested_fragment = name_match.group(1).strip(" .,!").lower()
+            # trim off trailing scheduling words
+            requested_fragment = re.split(r"\b(?:for|tomorrow|today|at|on|in)\b", requested_fragment)[0].strip()
+            # remove leading honorifics like Dr
+            requested_fragment = re.sub(r"^dr\.?\s*", "", requested_fragment, flags=re.IGNORECASE).strip()
             fragment_tokens = [
                 token for token in re.findall(r"[a-z]+", requested_fragment)
                 if token not in {"doctor", "dr", "doc", "appointment", "with", "book", "consult"}
@@ -198,13 +202,17 @@ def _extract_doctor_id_only(db: Session, user_input: str) -> Optional[Doctor]:
 
 def _extract_requested_doctor_name(user_input: str) -> Optional[str]:
     patterns = [
-        r"(?:doctor|dr\.?)\s+([A-Za-z][A-Za-z\s]{1,40})",
-        r"(?:appointment of|appointment with|book with)\s+([A-Za-z][A-Za-z\s]{1,40})",
+        r"(?:doctor|dr\.? )\s+([A-Za-z][A-Za-z\s]{1,40})",
+        r"(?:appointment of|appointment with|book with|appointment for)\s+([A-Za-z][A-Za-z\s]{1,40})",
     ]
     for pattern in patterns:
         match = re.search(pattern, user_input, re.IGNORECASE)
         if match:
-            return match.group(1).strip(" .,!").title()
+            fragment = match.group(1).strip(" .,!").lower()
+            # Trim scheduling words and honorifics
+            fragment = re.split(r"\b(?:for|tomorrow|today|at|on|in)\b", fragment)[0].strip()
+            fragment = re.sub(r"^dr\.?\s*", "", fragment, flags=re.IGNORECASE).strip()
+            return fragment.title()
     return None
 
 
@@ -381,6 +389,7 @@ def _build_rule_reply(session: Dict[str, Any], doctor: Optional[Doctor], booked:
     if not session["doctor_id"]:
         return (
             "Please choose a doctor by id or name. Available doctors are:\n"
+
             f"{session.get('doctor_list', '')}"
         )
     if not session["date_time"]:
