@@ -1,4 +1,7 @@
 import re
+import hmac
+import hashlib
+import uuid
 from pathlib import Path
 from datetime import datetime
 
@@ -7,11 +10,16 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from dotenv import load_dotenv
 from db_config import init_db, seed_sample_data, SessionLocal, Doctor, Vaccine, Appointment
 from chatbot import get_chat_reply
 import os
+import requests
 
+load_dotenv()
 port = int(os.environ.get("PORT", 8000))
+RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID")
+RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET")
 
 app = FastAPI()
 init_db()
@@ -72,6 +80,18 @@ class ChatRequest(BaseModel):
     session_id: str | None = None
 
 
+class CreateOrderRequest(BaseModel):
+    amount: int
+    currency: str = "INR"
+    receipt: str | None = None
+
+
+class VerifyPaymentRequest(BaseModel):
+    razorpay_payment_id: str
+    razorpay_order_id: str
+    razorpay_signature: str
+
+
 @app.get("/")
 def root():
     return FileResponse(STATIC_DIR / "index.html")
@@ -125,12 +145,179 @@ def get_appointment_status(appointment_id: int, db: Session = Depends(get_db)):
         "patient_name": appointment.patient_name,
         "doctor_name": doctor.name if doctor else None,
         "date_time": appointment.date_time,
+        "amount_due": getattr(appointment, "amount_due", 0),
+        "payment_status": getattr(appointment, "payment_status", "pending"),
+        "razorpay_order_id": getattr(appointment, "razorpay_order_id", None),
+        "razorpay_payment_id": getattr(appointment, "razorpay_payment_id", None),
     }
 
 
 @app.post("/chat/")
 def chat(payload: ChatRequest, db: Session = Depends(get_db)):
     return get_chat_reply(payload.user_input, db, payload.session_id)
+
+
+@app.get("/api/payment-config")
+def get_payment_config():
+    if not RAZORPAY_KEY_ID:
+        raise HTTPException(status_code=500, detail="Razorpay key id is not configured")
+    return {"key_id": RAZORPAY_KEY_ID}
+
+
+@app.post("/api/create-order")
+def create_order(payload: CreateOrderRequest):
+    if payload.amount < 100:
+        raise HTTPException(status_code=400, detail="Amount must be at least 100 paise")
+
+    if not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
+        raise HTTPException(status_code=500, detail="Razorpay credentials are not configured")
+
+    order_payload = {
+        "amount": payload.amount,
+        "currency": payload.currency.upper(),
+        "receipt": payload.receipt or f"receipt_{uuid.uuid4().hex[:24]}",
+    }
+
+    try:
+        response = requests.post(
+            "https://api.razorpay.com/v1/orders",
+            json=order_payload,
+            auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET),
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=500, detail="Unable to create Razorpay order") from exc
+
+    if response.status_code == 401:
+        raise HTTPException(status_code=401, detail="Razorpay authentication failed")
+
+    if response.status_code >= 400:
+        raise HTTPException(status_code=500, detail="Razorpay order creation failed")
+
+    order = response.json()
+    return {
+        "order_id": order["id"],
+        "amount": order["amount"],
+        "currency": order["currency"],
+    }
+
+
+@app.post("/api/verify-payment")
+def verify_payment(payload: VerifyPaymentRequest):
+    if not all(
+        [
+            payload.razorpay_payment_id,
+            payload.razorpay_order_id,
+            payload.razorpay_signature,
+        ]
+    ):
+        raise HTTPException(status_code=400, detail="Missing payment verification fields")
+
+    if not RAZORPAY_KEY_SECRET:
+        raise HTTPException(status_code=500, detail="Razorpay key secret is not configured")
+
+    message = f"{payload.razorpay_order_id}|{payload.razorpay_payment_id}"
+    generated_signature = hmac.new(
+        RAZORPAY_KEY_SECRET.encode("utf-8"),
+        message.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    if not hmac.compare_digest(generated_signature, payload.razorpay_signature):
+        raise HTTPException(status_code=400, detail="Payment signature verification failed")
+
+    return {"success": True, "message": "Payment verified successfully"}
+
+
+@app.post("/appointments/{appointment_id}/create-order")
+def create_order_for_appointment(appointment_id: int, payload: CreateOrderRequest, db: Session = Depends(get_db)):
+    appointment = db.query(Appointment).filter(Appointment.id == appointment_id).first()
+    if not appointment:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+
+    if payload.amount < 100:
+        raise HTTPException(status_code=400, detail="Amount must be at least 100 paise")
+
+    if not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
+        raise HTTPException(status_code=500, detail="Razorpay credentials are not configured")
+
+    order_payload = {
+        "amount": payload.amount,
+        "currency": payload.currency.upper(),
+        "receipt": payload.receipt or f"appointment_{appointment_id}_{uuid.uuid4().hex[:12]}",
+    }
+
+    try:
+        response = requests.post(
+            "https://api.razorpay.com/v1/orders",
+            json=order_payload,
+            auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET),
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=500, detail="Unable to create Razorpay order") from exc
+
+    if response.status_code == 401:
+        raise HTTPException(status_code=401, detail="Razorpay authentication failed")
+
+    if response.status_code >= 400:
+        raise HTTPException(status_code=500, detail="Razorpay order creation failed")
+
+    order = response.json()
+
+    # persist order info on appointment
+    appointment.razorpay_order_id = order.get("id")
+    appointment.amount_due = payload.amount
+    appointment.payment_status = "pending"
+    db.add(appointment)
+    db.commit()
+
+    return {
+        "order_id": order["id"],
+        "amount": order["amount"],
+        "currency": order["currency"],
+    }
+
+
+@app.post("/appointments/{appointment_id}/verify-payment")
+def verify_payment_for_appointment(appointment_id: int, payload: VerifyPaymentRequest, db: Session = Depends(get_db)):
+    if not all(
+        [
+            payload.razorpay_payment_id,
+            payload.razorpay_order_id,
+            payload.razorpay_signature,
+        ]
+    ):
+        raise HTTPException(status_code=400, detail="Missing payment verification fields")
+
+    if not RAZORPAY_KEY_SECRET:
+        raise HTTPException(status_code=500, detail="Razorpay key secret is not configured")
+
+    message = f"{payload.razorpay_order_id}|{payload.razorpay_payment_id}"
+    generated_signature = hmac.new(
+        RAZORPAY_KEY_SECRET.encode("utf-8"),
+        message.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    if not hmac.compare_digest(generated_signature, payload.razorpay_signature):
+        raise HTTPException(status_code=400, detail="Payment signature verification failed")
+
+    appointment = db.query(Appointment).filter(Appointment.id == appointment_id).first()
+    if not appointment:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+
+    # verify order id matches
+    if appointment.razorpay_order_id and appointment.razorpay_order_id != payload.razorpay_order_id:
+        raise HTTPException(status_code=400, detail="Order id does not match appointment")
+
+    appointment.payment_status = "paid"
+    appointment.razorpay_payment_id = payload.razorpay_payment_id
+    db.add(appointment)
+    db.commit()
+
+    return {"success": True, "message": "Payment verified and linked to appointment"}
+
 
 @app.get("/health")
 def health():

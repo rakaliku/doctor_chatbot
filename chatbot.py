@@ -142,18 +142,22 @@ def _extract_doctor(db: Session, user_input: str) -> Optional[Doctor]:
     stripped = lowered.strip()
     has_doctor_context = any(
         phrase in lowered
-        for phrase in ["doctor", "dr ", "dr.", "appointment with", "book with", "consult with"]
+        for phrase in ["doctor", "dr ", "dr.", "appointment with", "appointment of", "appointment for", "book with", "consult with"]
     )
     doctors = db.query(Doctor).all()
 
     if has_doctor_context:
         name_match = re.search(
-            r"(?:doctor|dr\.?|doc|appointment with|book with|consult with)\s+([A-Za-z][A-Za-z\s]{0,40})",
+            r"(?:doctor|dr\.?|doc|appointment with|appointment of|appointment for|book with|consult with)\s+([A-Za-z][A-Za-z\s]{0,40})",
             user_input,
             re.IGNORECASE,
         )
         if name_match:
             requested_fragment = name_match.group(1).strip(" .,!").lower()
+            # trim off trailing scheduling words
+            requested_fragment = re.split(r"\b(?:for|tomorrow|today|at|on|in)\b", requested_fragment)[0].strip()
+            # remove leading honorifics like Dr
+            requested_fragment = re.sub(r"^dr\.?\s*", "", requested_fragment, flags=re.IGNORECASE).strip()
             fragment_tokens = [
                 token for token in re.findall(r"[a-z]+", requested_fragment)
                 if token not in {"doctor", "dr", "doc", "appointment", "with", "book", "consult"}
@@ -197,14 +201,29 @@ def _extract_doctor_id_only(db: Session, user_input: str) -> Optional[Doctor]:
 
 
 def _extract_requested_doctor_name(user_input: str) -> Optional[str]:
+    # Prefer explicit doctor/name phrases. Avoid using 'appointment for' which commonly precedes
+    # scheduling words (today/tomorrow) and can capture dates as names.
     patterns = [
-        r"(?:doctor|dr\.?)\s+([A-Za-z][A-Za-z\s]{1,40})",
-        r"(?:appointment of|appointment with|book with)\s+([A-Za-z][A-Za-z\s]{1,40})",
+        r"(?:doctor|dr\.? )\s+([A-Za-z][A-Za-z\s]{1,40})",
+        r"(?:appointment of|appointment with|book with|consult with)\s+([A-Za-z][A-Za-z\s]{1,40})",
     ]
     for pattern in patterns:
         match = re.search(pattern, user_input, re.IGNORECASE)
         if match:
-            return match.group(1).strip(" .,!").title()
+            fragment = match.group(1).strip(" .,!").lower()
+            # Trim scheduling words and honorifics if present
+            fragment = re.split(r"\b(?:for|tomorrow|today|at|on|in)\b", fragment)[0].strip()
+            fragment = re.sub(r"^dr\.?\s*", "", fragment, flags=re.IGNORECASE).strip()
+            # If fragment is a scheduling token (or empty) don't treat it as a doctor name
+            if not fragment:
+                return None
+            lower_frag = fragment.lower()
+            if lower_frag in {"today", "tomorrow", "tmrw", "tdy"}:
+                return None
+            # Basic guard against common schedule-related misspellings
+            if re.search(r"tomorr?w|tmr?w|tmorr?ow|tmotorw", lower_frag):
+                return None
+            return fragment.title()
     return None
 
 
@@ -381,6 +400,7 @@ def _build_rule_reply(session: Dict[str, Any], doctor: Optional[Doctor], booked:
     if not session["doctor_id"]:
         return (
             "Please choose a doctor by id or name. Available doctors are:\n"
+
             f"{session.get('doctor_list', '')}"
         )
     if not session["date_time"]:
@@ -592,17 +612,9 @@ def _finalize_chat_response(
     reply = _ensure_booking_details_in_reply(reply, session, doctor, appointment_id, booked)
     session["history"].append({"role": "assistant", "content": reply})
 
-    if booked:
-        _sessions[session_id] = {
-            "patient_name": None,
-            "doctor_id": None,
-            "date_time": None,
-            "appointment_id": None,
-            "pending_doctor_id": None,
-            "pending_date_time": None,
-            "pending_confirmation": None,
-            "history": [],
-        }
+    # Preserve session booking state so the user can continue (e.g., pay) after confirmation.
+    # Do not reset the session automatically on booking — allow the frontend and user to confirm next steps.
+    # If desired, a manual 'reset' action can clear the session.
 
     return {
         "session_id": session_id,
@@ -754,7 +766,10 @@ def get_chat_reply(user_input: str, db: Session, session_id: Optional[str] = Non
     booked = False
     appointment_id = None
     booking_error = None
-    if session["patient_name"] and session["doctor_id"] and session["date_time"]:
+    # Only create an appointment if all required fields are present and an appointment hasn't
+    # already been created for this session. This prevents duplicate bookings when the user
+    # selects doctor or date/time in separate messages.
+    if session["patient_name"] and session["doctor_id"] and session["date_time"] and not session.get("appointment_id"):
         try:
             appointment = Appointment(
                 patient_name=session["patient_name"],
@@ -774,6 +789,11 @@ def get_chat_reply(user_input: str, db: Session, session_id: Optional[str] = Non
         except (SQLAlchemyError, ValueError) as exc:
             db.rollback()
             booking_error = f"Could not save the appointment: {exc.__class__.__name__}."
+    elif session.get("appointment_id"):
+        # If appointment already exists for this session, surface it (avoid creating another).
+        booked = True
+        appointment_id = int(session.get("appointment_id"))
+        doctor = db.query(Doctor).filter(Doctor.id == int(session.get("doctor_id"))).first() if session.get("doctor_id") else None
 
     rule_reply = (
         booking_error

@@ -1,13 +1,17 @@
 import os
+from pathlib import Path
 
-from sqlalchemy import create_engine, Column, Integer, String, ForeignKey
+from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 # from dotenv import load_dotenv
 
 # load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./hospital.db")
+# Use a project-absolute SQLite path so the DB is consistent regardless of process cwd
+BASE_DIR = Path(__file__).resolve().parent
+_default_db = BASE_DIR / "hospital.db"
+DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{_default_db}")
 
 connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
 
@@ -38,12 +42,34 @@ class Appointment(Base):
     doctor_id = Column(Integer, ForeignKey("doctors.id"))
     vaccine_id = Column(Integer, ForeignKey("vaccines.id"), nullable=True)
     date_time = Column(String)
+    # Payment fields (amount stored in paise)
+    amount_due = Column(Integer, default=0)
+    payment_status = Column(String, default="pending")  # pending, paid
+    razorpay_order_id = Column(String, nullable=True)
+    razorpay_payment_id = Column(String, nullable=True)
     doctor = relationship("Doctor")
     vaccine = relationship("Vaccine")
 
 
 def init_db():
     Base.metadata.create_all(bind=engine)
+
+    # Add missing payment columns when upgrading an existing sqlite DB
+    try:
+        with engine.connect() as conn:
+            res = conn.execute(text("PRAGMA table_info('appointments')"))
+            cols = [row[1] for row in res.fetchall()]
+            if "amount_due" not in cols:
+                conn.execute(text("ALTER TABLE appointments ADD COLUMN amount_due INTEGER DEFAULT 0"))
+            if "payment_status" not in cols:
+                conn.execute(text("ALTER TABLE appointments ADD COLUMN payment_status VARCHAR DEFAULT 'pending'"))
+            if "razorpay_order_id" not in cols:
+                conn.execute(text("ALTER TABLE appointments ADD COLUMN razorpay_order_id VARCHAR"))
+            if "razorpay_payment_id" not in cols:
+                conn.execute(text("ALTER TABLE appointments ADD COLUMN razorpay_payment_id VARCHAR"))
+    except Exception:
+        # Best-effort migration; ignore failures here so startup still proceeds and errors surface at operation time
+        pass
 
 
 def seed_sample_data():

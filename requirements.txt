@@ -6,3 +6,4 @@ pydantic
 huggingface_hub
 psycopg2-binary
 python-dotenv
+razorpay
