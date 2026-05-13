@@ -201,17 +201,28 @@ def _extract_doctor_id_only(db: Session, user_input: str) -> Optional[Doctor]:
 
 
 def _extract_requested_doctor_name(user_input: str) -> Optional[str]:
+    # Prefer explicit doctor/name phrases. Avoid using 'appointment for' which commonly precedes
+    # scheduling words (today/tomorrow) and can capture dates as names.
     patterns = [
         r"(?:doctor|dr\.? )\s+([A-Za-z][A-Za-z\s]{1,40})",
-        r"(?:appointment of|appointment with|book with|appointment for)\s+([A-Za-z][A-Za-z\s]{1,40})",
+        r"(?:appointment of|appointment with|book with|consult with)\s+([A-Za-z][A-Za-z\s]{1,40})",
     ]
     for pattern in patterns:
         match = re.search(pattern, user_input, re.IGNORECASE)
         if match:
             fragment = match.group(1).strip(" .,!").lower()
-            # Trim scheduling words and honorifics
+            # Trim scheduling words and honorifics if present
             fragment = re.split(r"\b(?:for|tomorrow|today|at|on|in)\b", fragment)[0].strip()
             fragment = re.sub(r"^dr\.?\s*", "", fragment, flags=re.IGNORECASE).strip()
+            # If fragment is a scheduling token (or empty) don't treat it as a doctor name
+            if not fragment:
+                return None
+            lower_frag = fragment.lower()
+            if lower_frag in {"today", "tomorrow", "tmrw", "tdy"}:
+                return None
+            # Basic guard against common schedule-related misspellings
+            if re.search(r"tomorr?w|tmr?w|tmorr?ow|tmotorw", lower_frag):
+                return None
             return fragment.title()
     return None
 
