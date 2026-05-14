@@ -54,21 +54,27 @@ class Appointment(Base):
 def init_db():
     Base.metadata.create_all(bind=engine)
 
-    # Add missing payment columns when upgrading an existing sqlite DB
-    try:
-        with engine.connect() as conn:
-            res = conn.execute(text("PRAGMA table_info('appointments')"))
-            cols = [row[1] for row in res.fetchall()]
-            if "amount_due" not in cols:
-                conn.execute(text("ALTER TABLE appointments ADD COLUMN amount_due INTEGER DEFAULT 0"))
-            if "payment_status" not in cols:
-                conn.execute(text("ALTER TABLE appointments ADD COLUMN payment_status VARCHAR DEFAULT 'pending'"))
-            if "razorpay_order_id" not in cols:
-                conn.execute(text("ALTER TABLE appointments ADD COLUMN razorpay_order_id VARCHAR"))
-            if "razorpay_payment_id" not in cols:
-                conn.execute(text("ALTER TABLE appointments ADD COLUMN razorpay_payment_id VARCHAR"))
-    except Exception:
-        # Best-effort migration; ignore failures here so startup still proceeds and errors surface at operation time
+    # SQLite-only best-effort migrations: add missing payment columns when upgrading an existing sqlite DB
+    # For Postgres (Supabase), rely on SQLAlchemy migrations or manual ALTERs. Avoid running SQLite PRAGMA on Postgres.
+    if DATABASE_URL.startswith("sqlite"):
+        try:
+            with engine.connect() as conn:
+                res = conn.execute(text("PRAGMA table_info('appointments')"))
+                cols = [row[1] for row in res.fetchall()]
+                if "amount_due" not in cols:
+                    conn.execute(text("ALTER TABLE appointments ADD COLUMN amount_due INTEGER DEFAULT 0"))
+                if "payment_status" not in cols:
+                    conn.execute(text("ALTER TABLE appointments ADD COLUMN payment_status VARCHAR DEFAULT 'pending'"))
+                if "razorpay_order_id" not in cols:
+                    conn.execute(text("ALTER TABLE appointments ADD COLUMN razorpay_order_id VARCHAR"))
+                if "razorpay_payment_id" not in cols:
+                    conn.execute(text("ALTER TABLE appointments ADD COLUMN razorpay_payment_id VARCHAR"))
+        except Exception:
+            # Best-effort migration; ignore failures here so startup still proceeds and errors surface at operation time
+            pass
+    else:
+        # For Postgres (Supabase) we do not attempt PRAGMA-based migrations here.
+        # In production, use a proper migration tool (Alembic) or run ALTER TABLE statements explicitly as needed.
         pass
 
 

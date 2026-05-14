@@ -1,6 +1,6 @@
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -316,6 +316,59 @@ def _is_within_doctor_hours(doctor: Doctor, requested_date_time: str) -> bool:
     return start_minutes <= requested_minutes <= end_minutes
 
 
+def _is_past_datetime(requested_date_time: str) -> bool:
+    """Return True if the provided requested_date_time refers to a moment in the past.
+
+    If the parsed value contains only a time (no explicit date), treat it as today.
+    """
+    parsed = _parse_time_from_text(requested_date_time)
+    if parsed is None:
+        return False
+    now = datetime.now()
+    # If parsed has no explicit date (datetime.strptime with time-only yields year 1900), assume today
+    if parsed.year == 1900:
+        parsed = now.replace(hour=parsed.hour, minute=parsed.minute, second=0, microsecond=0)
+    return parsed < now
+
+
+def _next_available_slot(doctor: Doctor, parsed: datetime, max_days: int = 14):
+    """Find the next available datetime for the given doctor, starting from the parsed datetime.
+
+    Returns a tuple (label, datetime) where label is a human-friendly string like
+    'tomorrow at 09:30 AM' or 'May 16, 2026 at 09:30 AM'. Returns (None, None) if not found.
+    """
+    now = datetime.now()
+    # desired date (if parsed has no year, treat as today)
+    if parsed.year == 1900:
+        base_date = now.date()
+    else:
+        base_date = parsed.date()
+
+    desired_time = parsed.time()
+    start_time_str, end_time_str = _parse_available_range(doctor.available_time)
+    start_time = datetime.strptime(start_time_str, "%H:%M").time()
+    end_time = datetime.strptime(end_time_str, "%H:%M").time()
+
+    for offset in range(0, max_days):
+        candidate_date = base_date + timedelta(days=offset)
+        # choose desired time if within doctor's hours else choose doctor's start_time
+        candidate_time = desired_time if (start_time <= desired_time <= end_time) else start_time
+        candidate_dt = datetime.combine(candidate_date, candidate_time)
+        if candidate_dt <= now:
+            # skip times in the past
+            continue
+        # Format label
+        if candidate_date == now.date():
+            label = f"today at {_format_time_12h(candidate_time.strftime('%H:%M'))}"
+        elif candidate_date == (now.date() + timedelta(days=1)):
+            label = f"tomorrow at {_format_time_12h(candidate_time.strftime('%H:%M'))}"
+        else:
+            label = candidate_dt.strftime("%b %d, %Y at %I:%M %p")
+        return label, candidate_dt
+
+    return None, None
+
+
 def _build_out_of_hours_reply(doctor: Doctor) -> str:
     start_time, end_time = _parse_available_range(doctor.available_time)
     return (
@@ -508,15 +561,38 @@ def _build_llm_messages(
 
 def _reply_claims_booking(reply: str) -> bool:
     lowered = reply.lower()
-    return any(
-        phrase in lowered
-        for phrase in [
-            "appointment is booked",
-            "appointment has been booked",
-            "successfully booked",
-            "appointment details",
-        ]
-    )
+    # quick literal checks
+    literals = [
+        "appointment is booked",
+        "appointment has been booked",
+        "successfully booked",
+        "appointment details",
+        "appointment scheduled",
+        "appointment confirmed",
+        "has been confirmed",
+        "confirmed your appointment",
+        "your appointment is scheduled",
+        "thank you for confirming",
+        "thank you for confirming the appointment",
+    ]
+    if any(lit in lowered for lit in literals):
+        return True
+
+    # match 'scheduled' with optional words between, e.g. 'has been successfully scheduled'
+    if re.search(r"has been(?:\s+\w+){0,3}?\s+scheduled", lowered):
+        return True
+    if re.search(r"is(?:\s+\w+){0,2}?\s+scheduled", lowered):
+        return True
+
+    # catch explicit 'appointment id' mention even without numeric value
+    if re.search(r"appointment\s*(?:id|number|#)\b", lowered):
+        return True
+
+    # catch explicit numeric Appointment ID or booking number references (e.g., "Appointment ID: 123456")
+    if re.search(r"(?:appointment|booking)\s*(?:id|number|#)?\s*[:#\-]?\s*\d{3,}", reply, re.IGNORECASE):
+        return True
+
+    return False
 
 
 def _ensure_full_doctor_list_in_reply(reply: str, doctor_list: str, next_step: str) -> str:
@@ -610,6 +686,19 @@ def _finalize_chat_response(
         model_used = None
     reply = _ensure_full_doctor_list_in_reply(reply, doctor_list, next_step)
     reply = _ensure_booking_details_in_reply(reply, session, doctor, appointment_id, booked)
+
+    # If booking wasn't actually saved, scrub any booking- or id-like phrases HF might have inserted.
+    if not booked:
+        # remove phrases like 'appointment id: 123456', 'booking #123456', 'appointment number 123456', etc.
+        reply = re.sub(r"(?i)(?:appointment|booking|booking number|appointment number|appointment id|booking id|appointment #|booking #)\s*[:#\-]?\s*\d+", "", reply)
+        # remove stray standalone numeric sequences that look like an id (3+ digits) when adjacent to booking words
+        reply = re.sub(r"(?<=\b)(?:order|id|number)\s*[:#\-]?\s*\d{3,}\b", "", reply, flags=re.IGNORECASE)
+        # remove any remaining 6+ digit sequences to be conservative (avoid removing times like 09:30)
+        reply = re.sub(r"\b\d{6,}\b", "", reply)
+        # normalize whitespace and punctuation leftover
+        reply = re.sub(r"\s+", " ", reply).strip()
+        reply = re.sub(r"\s+\.", ".", reply)
+
     session["history"].append({"role": "assistant", "content": reply})
 
     # Preserve session booking state so the user can continue (e.g., pay) after confirmation.
@@ -632,6 +721,18 @@ def get_chat_reply(user_input: str, db: Session, session_id: Optional[str] = Non
     session_id, session = _get_session(session_id)
     doctor_list = _list_doctors(db)
     session.setdefault("history", [])
+    # Sanity: if the session references an appointment id that isn't present in DB, clear it
+    if session.get("appointment_id"):
+        try:
+            from db_config import Appointment as _Appointment
+
+            appt = db.query(_Appointment).filter(_Appointment.id == int(session.get("appointment_id"))).first()
+            if not appt:
+                session["appointment_id"] = None
+        except Exception:
+            # Be conservative: clear malformed appointment ids
+            session["appointment_id"] = None
+
     session["history"].append({"role": "user", "content": user_input.strip()})
 
     name = _extract_name(user_input)
@@ -661,6 +762,47 @@ def get_chat_reply(user_input: str, db: Session, session_id: Optional[str] = Non
         session["pending_date_time"] = None
         session["pending_doctor_id"] = None
         session["pending_confirmation"] = None
+
+        # If the user requested a time that has already passed today, pick the next available slot
+        if _is_past_datetime(session["date_time"]):
+            parsed = _parse_time_from_text(session["date_time"])
+            # resolve the doctor object if available
+            doctor_obj = doctor if doctor else (db.query(Doctor).filter(Doctor.id == int(session.get("doctor_id"))).first() if session.get("doctor_id") else None)
+            if doctor_obj:
+                suggested_label, suggested_dt = _next_available_slot(doctor_obj, parsed)
+                if suggested_label:
+                    session["pending_date_time"] = suggested_label
+                    session["pending_confirmation"] = "auto_suggest"
+                    rule_reply = f"The requested time has already passed. The next available slot is {suggested_label}. Would you like me to book that?"
+                    next_step = "review"
+                    return _finalize_chat_response(
+                        user_input=user_input,
+                        rule_reply=rule_reply,
+                        session_id=session_id,
+                        session=session,
+                        doctor_list=doctor_list,
+                        next_step=next_step,
+                        doctor=doctor_obj,
+                    )
+            # Fallback: suggest tomorrow at same time if we couldn't compute next slot
+            try:
+                time_label = _format_time_12h(parsed.strftime("%H:%M"))
+            except Exception:
+                time_label = f"{parsed.hour}:{parsed.minute:02d}"
+            suggested = f"tomorrow at {time_label}"
+            session["pending_date_time"] = suggested
+            session["pending_confirmation"] = "tomorrow"
+            rule_reply = f"The requested time has already passed today. Would you like to book {suggested} instead?"
+            next_step = "review"
+            return _finalize_chat_response(
+                user_input=user_input,
+                rule_reply=rule_reply,
+                session_id=session_id,
+                session=session,
+                doctor_list=doctor_list,
+                next_step=next_step,
+                doctor=db.query(Doctor).filter(Doctor.id == int(session.get("doctor_id"))).first() if session.get("doctor_id") else None,
+            )
 
     if not session["patient_name"] and not wants_doctor_list_only:
         if requested_doctor_name and not doctor:
@@ -766,10 +908,15 @@ def get_chat_reply(user_input: str, db: Session, session_id: Optional[str] = Non
     booked = False
     appointment_id = None
     booking_error = None
-    # Only create an appointment if all required fields are present and an appointment hasn't
-    # already been created for this session. This prevents duplicate bookings when the user
-    # selects doctor or date/time in separate messages.
-    if session["patient_name"] and session["doctor_id"] and session["date_time"] and not session.get("appointment_id"):
+    # Only create an appointment if all required fields are present, the date/time is final (no pending confirmation),
+    # and an appointment hasn't already been created for this session. This prevents duplicate or premature bookings.
+    if (
+        session["patient_name"]
+        and session["doctor_id"]
+        and session["date_time"]
+        and not session.get("pending_confirmation")
+        and not session.get("appointment_id")
+    ):
         try:
             appointment = Appointment(
                 patient_name=session["patient_name"],
